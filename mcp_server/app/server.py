@@ -17,6 +17,10 @@ get_kb_chunks 去 Azure AI Search 撈那份檔案的 chunk 全文。⚠️ get_k
 沒有辦法知道呼叫者是誰，所以預設只放行「全公司可見」的文件，原因與開關見
 app/tools/kb_chunks.py 開頭的權限說明。
 
+ui_action 那包（open_translate_modal / open_summary_modal / open_sign_modal）
+是特例：伺服器端什麼都不做，只為了讓「要開哪個視窗」這個決定落進 openclaw 的
+session history，由 router 轉成 SSE 事件叫前端開視窗，詳見該檔案開頭。
+
 create_excel/create_word/create_ppt 都是用結構化參數（表格資料、公式字串、
 圖表定義、段落/投影片內容）驅動 openpyxl/python-docx/python-pptx，不是讓
 模型自己寫程式碼執行，所以不需要額外的 code sandbox。
@@ -33,7 +37,8 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 
 from app.module import dynamic_skills  # noqa: E402
 from app.tools import (create_excel, create_ppt, create_word, kb_chunks,  # noqa: E402
-                       knowledge_search, read_url, structured_db, web_search)
+                       knowledge_search, read_url, structured_db, ui_action,
+                       web_search)
 
 
 @asynccontextmanager
@@ -59,7 +64,11 @@ web_search.register(server)
 read_url.register(server)
 structured_db.register(server)
 kb_chunks.register(server)
+ui_action.register(server)
 dynamic_skills.register_admin_routes(server)
+# openclaw 的 kb-search plugin 走這條純 HTTP 入口（不是 MCP tool），
+# 才能 per-call 帶 X-Emp-Id；理由見 knowledge_search.register_http_routes。
+knowledge_search.register_http_routes(server)
 
 
 def main() -> None:

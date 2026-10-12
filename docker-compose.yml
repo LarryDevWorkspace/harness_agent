@@ -15,6 +15,11 @@ services:
     container_name: harness-mcp_server
     build: ./mcp_server
     env_file: ./mcp_server/.env         # RAG 位址等設定（tool-calling 從 backend 搬過來的）
+    volumes:
+      # KB search 的檢索紀錄（模型/後端帶進來的 filter 參數＋完整結果）寫在容器內
+      # /app/log，掛出來才留得住——不掛的話 container 一重建就整包不見。
+      # 一天一個 kb_search-YYYY-MM-DD.jsonl，見 mcp_server/app/module/kb_log.py。
+      - ./mcp_server/log:/app/log
     depends_on: [db_api, skill_runner]
     # 三掛：harness-net 連 db_api/backend，skill-net 連 skill_runner（code 技能沙盒），
     # kiki-chat-openclaw-network 讓 kiki-chat-openclaw 那邊的兩個 openclaw 節點連得到
@@ -25,6 +30,27 @@ services:
     extra_hosts:
       # deveip3 這台在這個環境的網路裡沒有 DNS 紀錄，KB_BACKEND=azure 要打
       # AskQuestionStream 得靠這裡手動指到內網 IP 才能解析。
+      - "deveip3.avc.co:192.168.31.74"
+
+  mcp_server_eip:
+    container_name: harness-mcp_server_eip
+    build: ./mcp_server_eip
+    env_file: ./mcp_server_eip/.env    # DNN 位址、簽章 secret、身分信任開關
+    # 刻意跟 mcp_server 分開成兩個 process：mcp_server 有 dynamic_skills
+    # （使用者可自建 http/code 技能），DNN 寫入憑證跟它同一個 process 就等於
+    # 憑證離「被使用者自建技能撈走」只有一步。詳見 mcp_server_eip/main.py。
+    #
+    # 只掛 harness-net、且不發布 port —— 這個 process 持有 DNN 寫入權，
+    # 不可以是瀏覽器可達的。要讓 openclaw 直接當 MCP tool server 用的話，
+    # 得再加 kiki-chat-openclaw-network（會擴大可達範圍，先不加）。
+    networks: [harness-net]
+    # 容器內綁 0.0.0.0（綁 127.0.0.1 其他 container 就連不進來），
+    # 靠「不發布 port + 只在 harness-net」取代 loopback 隔離。
+    # 注意：0.0.0.0 + TRUST_EMP_ID_HEADER=true 會被 config.validate() 擋掉，
+    # 見 mcp_server_eip/.env 的說明。
+    extra_hosts:
+      # DNN_BASE_URL 指向的 deveip3 在這個環境沒有 DNS 紀錄，跟 mcp_server 一樣
+      # 要手動指到內網 IP，不然這個 container 連 dnn.py 的任何端點都解析不到。
       - "deveip3.avc.co:192.168.31.225"
 
   skill_runner:

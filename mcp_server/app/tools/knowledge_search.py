@@ -20,6 +20,7 @@ KB_BACKEND=azure：改打公司 KBApi/AskQuestionStream（SSE），那支本身�
 帶進來的 filter 參數（含 knowledge_search_plain 那條「模型自己填的」
 filter_criteria 原樣）＋完整結果，用來事後追查權限範圍對不對、撈到什麼。
 """
+import asyncio
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from mcp_types import CallToolResult, TextContent
 
 from app.module import db_client as db
 from app.module import kb_log
+from app.module import kb_scope
 from app.module.logs import get as get_logger
 
 log = get_logger("knowledge_search")
@@ -370,3 +372,95 @@ def register(server) -> None:
             filter_source="model" if filter_criteria else "env:empty_filter_criteria",
         )
         return CallToolResult(content=[TextContent(type="text", text=content)])
+
+
+def register_http_routes(server) -> None:
+    """給 openclaw 的 kb-search plugin 用的純 HTTP 入口（見 openclaw_plugins/kb-search/）。
+
+    為什麼需要這條路：openclaw 的 MCP client 每條連線的 header 是設定檔裡的固定
+    值，沒辦法依每次呼叫動態帶入呼叫者身分——這正是 knowledge_search_plain 只好
+    把權限範圍開成模型看得到的 tool 參數的原因。改由 openclaw 這端的原生 plugin
+    從 runtime 的 toolContext.agentId（本部署就是工號，模型看不到也改不掉）解出
+    身分，再用 X-Emp-Id header 打進這裡，權限範圍就回到跟 knowledge_search 同一
+    個保證等級：只由呼叫端身分決定。
+
+    另外掛一支 PUT /kb/scope 收「前端勾選的自訂檢索範圍」——openclaw 沒有
+    per-request 的任意資料通道，範圍只能繞過它從 backend 直接寫進來，理由與
+    「範圍只能縮小不能放大」的推導見 app/module/kb_scope.py 開頭。
+
+    檢索邏輯完全共用 knowledge_search 那條路（_resolve_filter + _search_and_log），
+    這裡只負責「HTTP 進、JSON 出」，不要在這裡長出第二套檢索行為。
+    """
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    async def _json_body(request: Request):
+        try:
+            return await request.json()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @server.custom_route("/kb/scope", methods=["PUT"])
+    async def _kb_scope(request: Request) -> JSONResponse:
+        body = await _json_body(request)
+        if body is None:
+            return JSONResponse({"error": "request body 必須是 JSON"}, status_code=400)
+        session_key = (body.get("session_key") or "").strip()
+        if not session_key:
+            return JSONResponse({"error": "session_key 必填"}, status_code=400)
+        try:
+            scope = kb_scope.validate(body.get("scope"))
+        except kb_scope.ScopeError as e:
+            # 不合法就擋在寫入這一刻，讓 backend 立刻知道；默默忽略的話前端會
+            # 以為範圍有生效，實際上查的是全部。
+            return JSONResponse({"error": str(e)}, status_code=400)
+        kb_scope.put(session_key, scope)
+        return JSONResponse({"ok": True, "scope": scope})
+
+    @server.custom_route("/kb/search", methods=["POST"])
+    async def _kb_search(request: Request) -> JSONResponse:
+        body = await _json_body(request)
+        if body is None:
+            return JSONResponse({"error": "request body 必須是 JSON"}, status_code=400)
+        query = (body or {}).get("query")
+        if not isinstance(query, str) or not query.strip():
+            return JSONResponse({"error": "query 必填，且必須是非空字串"}, status_code=400)
+
+        # 沒帶 X-Emp-Id 不是錯誤：openclaw 的預設 agent（main）本來就不對應任何
+        # 工號，這時跟「查不到權限」一樣退回環境變數 RAG_FILTER，不要擋下整個檢索。
+        emp_id = (request.headers.get("x-emp-id") or "").strip() or None
+        # 只為了 log：出事時要能分辨「plugin 解出來的 agentId」跟「真的拿去查表的
+        # emp_id」是不是同一個（例如 agentId 被正規化過）。
+        agent_id = (request.headers.get("x-openclaw-agent-id") or "").strip() or None
+        session_key = (request.headers.get("x-openclaw-session-key") or "").strip() or None
+
+        filter_list, filter_source = _resolve_filter(emp_id)
+        scope = kb_scope.get(session_key)
+        narrowed = kb_scope.narrow(filter_list, scope)
+
+        record_fields = dict(
+            tool="knowledge_search_plugin",
+            emp_id=emp_id,
+            filter_from_model=None,  # 這條路的 filter 模型碰不到，跟 knowledge_search 一樣
+            filter_source=filter_source,
+            caller_agent_id=agent_id,
+            session_key=session_key,
+            # 範圍是前端給的，一樣要留證：事後才分得出「查不到」是權限不夠還是範圍太窄。
+            scope=scope,
+            filter_before_scope=filter_list,
+        )
+
+        if narrowed is None:
+            # 交集為空。絕對不能改送空陣列給 RAG——那等於完全不過濾（見 kb_scope.narrow）。
+            content = "指定範圍內查無相關資料。"
+            kb_log.write({**record_fields, "kb_backend": KB_BACKEND, "query": query,
+                          "filter_used": None, "scope_empty_intersection": True,
+                          "result": {"content": content, "sources": [], "source_count": 0}})
+            return JSONResponse({"content": content, "sources": []})
+
+        # _search_and_log 整條是同步的（httpx 同步 client + 寫檔），直接在這裡跑會
+        # 卡住 server 的 event loop，丟到 thread 去。
+        content, sources = await asyncio.to_thread(
+            _search_and_log, query, narrowed, **record_fields
+        )
+        return JSONResponse({"content": content, "sources": sources})

@@ -1,0 +1,36 @@
+{
+  "id": "kb-search",
+  "name": "KB Search",
+  "description": "公司內部知識庫檢索（權限依呼叫端工號，不由模型決定）。",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "mcp_server base URL（預設 http://harness-mcp_server:9200）。"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "description": "單次檢索逾時毫秒數（預設 120000）。"
+      },
+      "anonymousAgentIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "不對應任何工號的 agentId 清單；命中時當作沒有登入者身分，由 mcp_server 退回環境變數 RAG_FILTER（預設 [\"main\"]）。"
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "knowledge_search"
+    ]
+  }
+}

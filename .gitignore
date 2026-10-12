@@ -7,3 +7,10 @@ db_api/.env
 .vscode/
 tmp/
 .claude/
+mcp_server_eip/
+mcp_server/log/
+.npm/
+.bin/
+node_modules/
+# openclaw plugin build 產物
+openclaw_plugins/*/dist/

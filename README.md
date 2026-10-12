@@ -7,13 +7,15 @@ frontend (Vite+Vue) ── 對話式深色 UI（登入 + workspace + 對話列�
       │  同源反代
 backend           ── 主邏輯：認證流程、harness、兩層記憶編排
       │  HTTP                              │  MCP（Streamable HTTP）
-db_api            ── 唯一連 DB 的服務   mcp_server ── tool-calling（calculator/
-      │                                              text_stats/get_weather/
-db (pgvector) + pgadmin   ── 獨立一包           knowledge_search）
+db_api            ── 唯一連 DB 的服務   mcp_server ── tool-calling（knowledge_search/
+      │                                              structured_db/get_kb_chunks/
+db (pgvector) + pgadmin   ── 獨立一包           create_excel…）
 ```
 
 - **db_api** 是唯一碰 Postgres 的服務；backend 完全不裝 DB driver。
 - **mcp_server** 是獨立的 MCP tool server（Streamable HTTP）：backend 當 MCP client 連過去取得 tool、呼叫執行，tool 本身不在 backend process 裡跑。knowledge_search 需要「依登入者身分」查 RAG 權限（db_api 的 user_permissions 表），backend 用 `X-Emp-Id` 這個 HTTP header 帶 emp_id 過去——header 不在 tool 的 JSON schema 裡，LLM 看不到、也改不動要用誰的權限查。
+- **openclaw 那條路**（kiki-chat-openclaw）：它的 MCP client 每條連線的 header 是設定檔裡的固定值，沒辦法 per-call 帶身分，所以 knowledge_search 在那邊改用 `openclaw_plugins/kb-search/` 這支原生 plugin——身分取自 openclaw runtime 給的 `agentId`（本部署就是工號），一樣不在 tool schema 裡，再用 `X-Emp-Id` 打 mcp_server 的 `POST /kb/search`。
+- **自訂檢索範圍**：openclaw 對 body 欄位與 header 都是固定白名單，沒有 per-request 的任意資料通道，所以前端勾選的範圍不能跟著問題傳——由 backend 在轉發前先 `PUT /kb/scope`（以 session key 為 key）寫進 mcp_server，plugin 查詢時帶 session key 取回套用。範圍只能**縮小**：只接受 `docType`/`metadataIds`/`allowDirect` 三個沒有 `ALL`/`''` 逃生門的欄位，`compCode`/`depCode`/`empID` 一律拒收（拿它們限縮會造成權限放大）。
 - **記憶兩層**：短期＝單一對話的滾動摘要 + 最近幾輪；長期＝綁 user 的事實，用 pgvector 語意召回。
 - **workspace** 為租戶邊界，可多人共用；長期記憶綁 user。
 
@@ -100,10 +102,15 @@ tool-calling 在獨立的 `mcp_server/` 服務裡（不在 backend process 內�
 
     mcp_server/                 # 獨立 MCP tool server（Streamable HTTP）
       app/
-        tools/                   # calculator / text_stats / weather / knowledge_search
+        tools/                   # knowledge_search / structured_db（含 query_kb_attachments）
+                                 #   / kb_chunks / web_search / read_url / create_excel|word|ppt
         module/db_client.py      # HTTP client → db_api（knowledge_search 查 emp_id 權限用）
         server.py                # MCPServer 實例 + tool 註冊 + 進入點
       .env.example               # RAG_BASE_URL 等（從 backend 搬過來的設定）
+
+    openclaw_plugins/           # 給 kiki-chat-openclaw 那包裝的 openclaw 原生 plugin
+      kb-search/                 # 知識庫檢索：權限身分取自 openclaw runtime 的 agentId
+                                 #   （＝工號），轉發 mcp_server 的 POST /kb/search
 
 啟動：`db_api` 的 Docker 進入點會先 `alembic upgrade head` 再開服務；
 connection string 走各自 `.env` 的 `DATABASE_URL`（compose 已用 `postgresql+psycopg://`）。
